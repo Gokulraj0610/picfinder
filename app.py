@@ -20,26 +20,32 @@ import time
 # Initialize Flask app
 app = Flask(__name__)
 
-# Configure CORS with specific options
+# Configure CORS with all options
 cors_config = {
-    "origins": ["*"],  # In production, replace with your frontend domain
-    "methods": ["GET", "POST", "OPTIONS"],
-    "allow_headers": ["Content-Type", "Authorization"],
+    "origins": ["*"],  
+    "methods": ["GET", "POST", "OPTIONS", "PUT", "DELETE"],
+    "allow_headers": ["Content-Type", "Authorization", "Access-Control-Allow-Credentials", "Access-Control-Allow-Origin"],
     "expose_headers": ["Content-Range", "X-Content-Range"],
     "supports_credentials": True,
-    "max_age": 3600
+    "max_age": 3600,
+    "send_wildcard": True
 }
 
-CORS(app, resources={
-    r"/*": cors_config  # Apply to all routes
-})
+CORS(app, resources={r"/*": cors_config})
 
-# Specific CORS configuration for all responses
+# Additional CORS headers for all responses
 @app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    
+    # Handle preflight requests
+    if request.method == 'OPTIONS':
+        return response
+    
     return response
 
 STATIC_FOLDER = 'static'
@@ -261,8 +267,11 @@ def set_folder_id():
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
-@app.route('/search-face', methods=['POST'])
+@app.route('/search-face', methods=['POST', 'OPTIONS'])
 def search_face():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+        
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
 
