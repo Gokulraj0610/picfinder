@@ -19,7 +19,28 @@ import time
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+
+# Configure CORS with specific options
+cors_config = {
+    "origins": ["*"],  # In production, replace with your frontend domain
+    "methods": ["GET", "POST", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization"],
+    "expose_headers": ["Content-Range", "X-Content-Range"],
+    "supports_credentials": True,
+    "max_age": 3600
+}
+
+CORS(app, resources={
+    r"/*": cors_config  # Apply to all routes
+})
+
+# Specific CORS configuration for all responses
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    return response
 
 STATIC_FOLDER = 'static'
 if not os.path.exists(STATIC_FOLDER):
