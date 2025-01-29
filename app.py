@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from googleapiclient.discovery import build
@@ -16,14 +16,32 @@ from queue import Queue
 import numpy as np
 from functools import lru_cache
 import time
+import gc
+import multiprocessing
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)
 
-STATIC_FOLDER = 'static'
-if not os.path.exists(STATIC_FOLDER):
-    os.makedirs(STATIC_FOLDER)
+# Configure CORS with all necessary headers
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "expose_headers": ["Content-Range", "X-Content-Range"],
+        "max_age": 3600,
+        "supports_credentials": True
+    }
+})
+
+# Add CORS headers to all responses
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    gc.collect()  # Force garbage collection after each request
+    return response
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -34,14 +52,16 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.readonly']
 MAX_IMAGE_SIZE = 15 * 1024 * 1024  # 15MB
 REKOGNITION_MAX_SIZE = 5 * 1024 * 1024  # 5MB AWS limit
-BATCH_SIZE = 10
+BATCH_SIZE = 5  # Reduced batch size
 CACHE_TTL = 3600
+MAX_WORKERS = 2  # Reduced from 4 to 2
 
-# Initialize cache
+# Optimized Image Cache
 class ImageCache:
-    def __init__(self):
+    def __init__(self, max_size=50):
         self.cache = {}
         self.lock = threading.Lock()
+        self.max_size = max_size
 
     def get(self, key):
         with self.lock:
@@ -51,10 +71,14 @@ class ImageCache:
                     return data
                 else:
                     del self.cache[key]
+                    gc.collect()
             return None
 
     def set(self, key, value):
         with self.lock:
+            if len(self.cache) >= self.max_size:
+                oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+                del self.cache[oldest_key]
             self.cache[key] = (value, time.time())
 
 image_cache = ImageCache()
@@ -62,54 +86,38 @@ image_cache = ImageCache()
 # Thread-local storage
 thread_local = threading.local()
 
+# Optimized Image Processor
 class OptimizedImageProcessor:
-    def __init__(self, max_workers=4):
+    def __init__(self, max_workers=MAX_WORKERS):
         self.max_workers = max_workers
-        self.process_queue = Queue()
-        self.results = []
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        self.processed_hashes = set()
         
     @staticmethod
     def optimize_image(img_bytes, target_size=(800, 800), quality=85):
         try:
-            img = Image.open(io.BytesIO(img_bytes))
-            
-            if img.mode in ('RGBA', 'LA'):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[-1])
-                img = background
-            
-            aspect = img.size[0] / img.size[1]
-            if aspect > 1:
-                new_size = (target_size[0], int(target_size[1] / aspect))
-            else:
-                new_size = (int(target_size[0] * aspect), target_size[1])
-            
-            img = img.resize(new_size, Image.LANCZOS)
-            
-            output = io.BytesIO()
-            img.save(output, format='JPEG', quality=quality, optimize=True, progressive=True)
-            return output.getvalue()
-            
+            with Image.open(io.BytesIO(img_bytes)) as img:
+                if img.mode in ('RGBA', 'LA'):
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[-1])
+                    img = background
+
+                aspect = img.size[0] / img.size[1]
+                new_size = (
+                    min(target_size[0], img.size[0]),
+                    min(target_size[1], img.size[1])
+                )
+                
+                if img.size != new_size:
+                    img = img.resize(new_size, Image.LANCZOS)
+                
+                output = io.BytesIO()
+                img.save(output, format='JPEG', quality=quality, optimize=True, progressive=True)
+                return output.getvalue()
         except Exception as e:
             raise Exception(f"Image optimization failed: {str(e)}")
 
-    def process_batch(self, image_batch):
-        futures = []
-        for img_data in image_batch:
-            future = self.thread_pool.submit(self.optimize_image, img_data)
-            futures.append(future)
-        return concurrent.futures.wait(futures)
-
-    @staticmethod
-    @lru_cache(maxsize=1000)
-    def get_image_hash(image_bytes):
-        img = Image.open(io.BytesIO(image_bytes))
-        img = img.convert('L').resize((8, 8), Image.LANCZOS)
-        pixels = np.array(img.getdata(), dtype=np.float64).reshape((8, 8))
-        dct = np.abs(np.fft.dct(np.fft.dct(pixels, axis=0), axis=1))
-        return hash(dct.tobytes())
+    def __del__(self):
+        self.thread_pool.shutdown(wait=False)
 
 def get_drive_service():
     if not hasattr(thread_local, "drive_service"):
@@ -182,64 +190,37 @@ def compare_faces_with_collection(image_bytes):
         drive_images = list_drive_images()
         matches = []
         
-        batch_size = 10
-        for i in range(0, len(drive_images), batch_size):
-            batch = drive_images[i:i + batch_size]
+        for i in range(0, len(drive_images), BATCH_SIZE):
+            batch = drive_images[i:i + BATCH_SIZE]
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 future_to_file = {
-                    executor.submit(process_single_comparison, 
-                                  optimized_source, 
-                                  drive_file,
-                                  processor): drive_file 
+                    executor.submit(process_single_comparison, optimized_source, drive_file, processor): drive_file 
                     for drive_file in batch
                 }
                 
                 for future in concurrent.futures.as_completed(future_to_file):
-                    file_data = future_to_file[future]
                     try:
-                        result = future.result()
+                        result = future.result(timeout=30)  # 30 second timeout per comparison
                         if result:
                             matches.append(result)
                     except Exception as e:
-                        logger.error(f"Error processing {file_data['name']}: {e}")
+                        logger.error(f"Error in comparison: {e}")
                         continue
 
-        matches.sort(key=lambda x: x['similarity'], reverse=True)
-        return matches
+            time.sleep(0.1)  # Small delay between batches
+            gc.collect()  # Garbage collection between batches
+
+        return sorted(matches, key=lambda x: x['similarity'], reverse=True)
 
     except Exception as e:
         logger.error(f"Error in face comparison: {e}")
         return {'error': str(e)}
 
-# Routes
-@app.route('/')
-def home():
-    return send_file('index.html')
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-@app.route('/static/<path:path>')
-def send_static(path):
-    return send_from_directory('static', path)
-
-@app.route('/app.js')
-def serve_js():
-    return send_from_directory('.', 'app.js')
-
-@app.route('/styles.css')
-def serve_css():
-    return send_from_directory('.', 'styles.css')
-
-@app.route('/set-folder-id', methods=['POST'])
-def set_folder_id():
-    global DRIVE_FOLDER_ID
-    data = request.json
-    DRIVE_FOLDER_ID = data.get('folderId')
-    try:
-        folder_metadata = get_drive_service().files().get(fileId=DRIVE_FOLDER_ID, fields="name").execute()
-        return jsonify({'success': True, 'folderName': folder_metadata.get('name')})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
-
+# API Routes
 @app.route('/search-face', methods=['POST'])
 def search_face():
     if 'file' not in request.files:
@@ -254,8 +235,13 @@ def search_face():
         if len(image_bytes) > MAX_IMAGE_SIZE:
             return jsonify({'error': 'Image size must be less than 15MB'}), 400
 
-        matches = compare_faces_with_collection(image_bytes)
-        
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(compare_faces_with_collection, image_bytes)
+            try:
+                matches = future.result(timeout=90)
+            except concurrent.futures.TimeoutError:
+                return jsonify({'error': 'Operation timed out'}), 408
+
         if isinstance(matches, dict) and 'error' in matches:
             return jsonify({'error': matches['error']}), 400
 
@@ -267,16 +253,32 @@ def search_face():
     except Exception as e:
         logger.error(f"Error in search_face: {e}")
         return jsonify({'error': str(e)}), 500
+    finally:
+        gc.collect()
+
+@app.route('/set-folder-id', methods=['POST'])
+def set_folder_id():
+    global DRIVE_FOLDER_ID
+    try:
+        data = request.json
+        DRIVE_FOLDER_ID = data.get('folderId')
+        folder_metadata = get_drive_service().files().get(
+            fileId=DRIVE_FOLDER_ID, 
+            fields="name"
+        ).execute()
+        return jsonify({
+            'success': True, 
+            'folderName': folder_metadata.get('name')
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
 
 @app.route('/image/<file_id>')
 def serve_image(file_id):
     try:
         cached_image = image_cache.get(f"img_{file_id}")
         if cached_image:
-            return send_file(
-                io.BytesIO(cached_image),
-                mimetype='image/jpeg'
-            )
+            return send_file(io.BytesIO(cached_image), mimetype='image/jpeg')
 
         request = get_drive_service().files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -296,17 +298,11 @@ def serve_image(file_id):
                 target_size=(1200, 1200),
                 quality=90
             )
-            
             image_cache.set(f"img_{file_id}", optimized_image)
-            
-            return send_file(
-                io.BytesIO(optimized_image),
-                mimetype='image/jpeg'
-            )
+            return send_file(io.BytesIO(optimized_image), mimetype='image/jpeg')
         except Exception as e:
-            logger.warning(f"Image optimization failed, serving original: {e}")
+            logger.warning(f"Image optimization failed: {e}")
             return send_file(fh, mimetype='image/jpeg')
-            
     except Exception as e:
         logger.error(f"Error serving image {file_id}: {e}")
         return jsonify({'error': str(e)}), 404
@@ -316,9 +312,7 @@ def serve_image(file_id):
                 fh.close()
             except:
                 pass
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+        gc.collect()
 
 # Initialize services
 try:
@@ -339,4 +333,5 @@ except Exception as e:
     raise
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # For development only - production will use gunicorn
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
