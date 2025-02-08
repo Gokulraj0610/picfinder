@@ -7,3 +7,5 @@ google-auth-httplib2==0.1.0
 google-auth-oauthlib==1.0.0
 boto3==1.28.36
 Pillow==10.0.0
+gunicorn==21.2.0
+numpy==1.24.3
