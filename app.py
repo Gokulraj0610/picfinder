@@ -26,12 +26,15 @@ load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Setup CORS - Single configuration point
 CORS(app, resources={
     r"/*": {
         "origins": ["https://picfinder-develop.web.app", "http://localhost:3000"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True
+        "supports_credentials": True,
+        "expose_headers": ["Content-Type", "Authorization"]
     }
 })
 
@@ -70,16 +73,7 @@ AWS_CREDENTIALS = {
     "region": os.getenv('AWS_REGION', 'us-east-1')
 }
 
-# Add CORS headers for all responses
-@app.after_request
-def after_request(response):
-    origin = request.headers.get('Origin')
-    if origin in ['https://picfinder-develop.web.app', 'http://localhost:3000']:
-        response.headers.add('Access-Control-Allow-Origin', origin)
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-        response.headers.add('Access-Control-Allow-Credentials', 'true')
-    return response
+# Remove the @app.after_request decorator as CORS is now handled by flask-cors
 
 # Initialize cache
 class ImageCache:
@@ -337,14 +331,6 @@ def health():
 
 @app.route('/set-folder-id', methods=['POST', 'OPTIONS'])
 def set_folder_id():
-    if request.method == 'OPTIONS':
-        # Handle preflight request
-        response = jsonify({'status': 'ok'})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
-        response.headers.add('Access-Control-Allow-Methods', 'POST')
-        return response
-        
     try:
         data = request.get_json()
         folder_id = data.get('folderId')
@@ -352,9 +338,10 @@ def set_folder_id():
         if not folder_id:
             return jsonify({'error': 'No folder ID provided'}), 400
             
-        # Your folder ID processing logic here
+        global DRIVE_FOLDER_ID
+        DRIVE_FOLDER_ID = folder_id
         
-        return jsonify({'status': 'success'}), 200
+        return jsonify({'status': 'success', 'folderId': folder_id}), 200
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
