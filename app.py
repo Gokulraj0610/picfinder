@@ -27,19 +27,30 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
-# Setup CORS - Single configuration point
-CORS(app, resources={
-    r"/*": {
-        "origins": ["https://picfinder-develop.web.app", "http://localhost:3000"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True,
-        "expose_headers": ["Content-Type", "Authorization"]
-    }
-})
+# Enhanced CORS configuration
+CORS(app, 
+     resources={
+         r"/*": {
+             "origins": [
+                 "https://picfinder-develop.web.app",
+                 "http://localhost:3000"
+             ],
+             "methods": ["GET", "POST", "OPTIONS"],
+             "allow_headers": ["Content-Type", "Authorization"],
+             "expose_headers": ["Content-Type", "Authorization"],
+             "supports_credentials": True,
+             "send_wildcard": False,
+             "max_age": 86400
+         }
+     },
+     intercept_exceptions=True)
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup logging with more detailed configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -66,14 +77,12 @@ CREDENTIALS = {
     "universe_domain": "googleapis.com"
 }
 
-# AWS credentials from environment variables
+# AWS credentials
 AWS_CREDENTIALS = {
     "aws_access_key_id": os.getenv('AWS_ACCESS_KEY_ID'),
     "aws_secret_access_key": os.getenv('AWS_SECRET_ACCESS_KEY'),
     "region": os.getenv('AWS_REGION', 'us-east-1')
 }
-
-# Remove the @app.after_request decorator as CORS is now handled by flask-cors
 
 # Initialize cache
 class ImageCache:
@@ -131,6 +140,7 @@ class OptimizedImageProcessor:
             return output.getvalue()
             
         except Exception as e:
+            logger.error(f"Image optimization error: {str(e)}")
             raise Exception(f"Image optimization failed: {str(e)}")
 
     @staticmethod
@@ -144,18 +154,26 @@ class OptimizedImageProcessor:
 
 def get_drive_service():
     if not hasattr(thread_local, "drive_service"):
-        credentials = Credentials.from_service_account_info(CREDENTIALS, scopes=SCOPES)
-        thread_local.drive_service = build('drive', 'v3', credentials=credentials)
+        try:
+            credentials = Credentials.from_service_account_info(CREDENTIALS, scopes=SCOPES)
+            thread_local.drive_service = build('drive', 'v3', credentials=credentials)
+        except Exception as e:
+            logger.error(f"Failed to initialize Drive service: {e}")
+            raise
     return thread_local.drive_service
 
 def get_rekognition_client():
     if not hasattr(thread_local, "rekognition_client"):
-        thread_local.rekognition_client = boto3.client(
-            'rekognition',
-            aws_access_key_id=AWS_CREDENTIALS['aws_access_key_id'],
-            aws_secret_access_key=AWS_CREDENTIALS['aws_secret_access_key'],
-            region_name=AWS_CREDENTIALS['region']
-        )
+        try:
+            thread_local.rekognition_client = boto3.client(
+                'rekognition',
+                aws_access_key_id=AWS_CREDENTIALS['aws_access_key_id'],
+                aws_secret_access_key=AWS_CREDENTIALS['aws_secret_access_key'],
+                region_name=AWS_CREDENTIALS['region']
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize Rekognition client: {e}")
+            raise
     return thread_local.rekognition_client
 
 def list_drive_images():
@@ -332,19 +350,59 @@ def health():
 @app.route('/set-folder-id', methods=['POST', 'OPTIONS'])
 def set_folder_id():
     try:
+        if request.method == 'OPTIONS':
+            return '', 204  # Respond to preflight request
+            
+        if not request.is_json:
+            return jsonify({
+                'status': 'error',
+                'message': 'Content-Type must be application/json'
+            }), 415
+
         data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'status': 'error',
+                'message': 'No data provided'
+            }), 400
+            
         folder_id = data.get('folderId')
         
         if not folder_id:
-            return jsonify({'error': 'No folder ID provided'}), 400
+            return jsonify({
+                'status': 'error',
+                'message': 'No folder ID provided'
+            }), 400
+
+        # Validate folder ID exists in Drive
+        try:
+            drive_service = get_drive_service()
+            drive_service.files().get(fileId=folder_id).execute()
+        except Exception as e:
+            logger.error(f"Invalid folder ID: {e}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid folder ID'
+            }), 400
             
         global DRIVE_FOLDER_ID
         DRIVE_FOLDER_ID = folder_id
         
-        return jsonify({'status': 'success', 'folderId': folder_id}), 200
+        response = jsonify({
+            'status': 'success',
+            'message': 'Folder ID set successfully',
+            'folderId': folder_id
+        })
+        
+        return response, 200
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error in set_folder_id: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 @app.route('/search-face', methods=['POST'])
 def search_face():
@@ -372,11 +430,13 @@ def search_face():
 @app.route('/image/<file_id>')
 def serve_image(file_id):
     try:
+        # Try to get from cache first
         cached_image = image_cache.get(f"img_{file_id}")
         if cached_image:
             return send_file(
                 io.BytesIO(cached_image),
-                mimetype='image/jpeg'
+                mimetype='image/jpeg',
+                cache_timeout=CACHE_TTL
             )
 
         request = get_drive_service().files().get_media(fileId=file_id)
@@ -402,15 +462,23 @@ def serve_image(file_id):
             
             return send_file(
                 io.BytesIO(optimized_image),
-                mimetype='image/jpeg'
+                mimetype='image/jpeg',
+                cache_timeout=CACHE_TTL
             )
         except Exception as e:
             logger.warning(f"Image optimization failed, serving original: {e}")
-            return send_file(fh, mimetype='image/jpeg')
+            return send_file(
+                fh, 
+                mimetype='image/jpeg',
+                cache_timeout=CACHE_TTL
+            )
             
     except Exception as e:
         logger.error(f"Error serving image {file_id}: {e}")
-        return jsonify({'error': str(e)}), 404
+        return jsonify({
+            'status': 'error',
+            'message': f"Failed to retrieve image: {str(e)}"
+        }), 404
     finally:
         if 'fh' in locals():
             try:
@@ -419,36 +487,102 @@ def serve_image(file_id):
                 pass
 
 def allowed_file(filename):
+    """Check if the file extension is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Error handlers
+# Error handlers with enhanced logging and consistent response format
+@app.errorhandler(400)
+def bad_request_error(error):
+    logger.warning(f"400 error: {request.url} - {error}")
+    return jsonify({
+        "status": "error",
+        "error": "Bad Request",
+        "message": str(error),
+        "path": request.path
+    }), 400
+
 @app.errorhandler(404)
 def not_found_error(error):
+    logger.warning(f"404 error: {request.url}")
     return jsonify({
+        "status": "error",
         "error": "Not Found",
-        "message": "The requested resource was not found"
+        "message": "The requested resource was not found",
+        "path": request.path
     }), 404
+
+@app.errorhandler(405)
+def method_not_allowed_error(error):
+    logger.warning(f"405 error: {request.url} - {request.method}")
+    return jsonify({
+        "status": "error",
+        "error": "Method Not Allowed",
+        "message": f"The {request.method} method is not allowed for this endpoint",
+        "path": request.path
+    }), 405
+
+@app.errorhandler(413)
+def payload_too_large_error(error):
+    logger.warning(f"413 error: {request.url}")
+    return jsonify({
+        "status": "error",
+        "error": "Payload Too Large",
+        "message": "The uploaded file exceeds the maximum allowed size",
+        "path": request.path
+    }), 413
+
+@app.errorhandler(415)
+def unsupported_media_type_error(error):
+    logger.warning(f"415 error: {request.url}")
+    return jsonify({
+        "status": "error",
+        "error": "Unsupported Media Type",
+        "message": "The provided content type is not supported",
+        "path": request.path
+    }), 415
+
+@app.errorhandler(429)
+def too_many_requests_error(error):
+    logger.warning(f"429 error: {request.url}")
+    return jsonify({
+        "status": "error",
+        "error": "Too Many Requests",
+        "message": "Rate limit exceeded. Please try again later",
+        "path": request.path
+    }), 429
 
 @app.errorhandler(500)
 def internal_error(error):
+    logger.error(f"500 error: {error}")
     return jsonify({
+        "status": "error",
         "error": "Internal Server Error",
-        "message": str(error)
+        "message": "An unexpected error occurred",
+        "details": str(error) if app.debug else None,
+        "path": request.path
     }), 500
 
-# Initialize global variable
+@app.errorhandler(503)
+def service_unavailable_error(error):
+    logger.error(f"503 error: {error}")
+    return jsonify({
+        "status": "error",
+        "error": "Service Unavailable",
+        "message": "The service is temporarily unavailable",
+        "path": request.path
+    }), 503
+
+# Initialize global variables
 DRIVE_FOLDER_ID = None
 
-# Initialize services
 def init_services():
+    """Initialize all required services"""
     try:
         # Initialize Google Drive service
-        global drive_service
         credentials = Credentials.from_service_account_info(CREDENTIALS, scopes=SCOPES)
         drive_service = build('drive', 'v3', credentials=credentials)
         
         # Initialize AWS Rekognition client
-        global rekognition_client
         rekognition_client = boto3.client(
             'rekognition',
             aws_access_key_id=AWS_CREDENTIALS['aws_access_key_id'],
@@ -460,28 +594,34 @@ def init_services():
         return True
         
     except Exception as e:
-        logger.error(f"Error during service initialization: {e}")
+        logger.critical(f"Error during service initialization: {e}")
         return False
 
 if __name__ == '__main__':
     # Initialize services
     if not init_services():
-        logger.error("Failed to initialize services")
+        logger.critical("Failed to initialize services")
         raise SystemExit("Application startup failed")
     
-    # Get port from environment variable or default to 5000
+    # Get configuration from environment variables
     port = int(os.getenv('PORT', 5000))
-    
-    # Get host from environment variable or default to '0.0.0.0'
     host = os.getenv('HOST', '0.0.0.0')
-    
-    # Get debug mode from environment variable
     debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
     
+    # Configure SSL if certificates are provided
+    ssl_context = None
+    ssl_cert = os.getenv('SSL_CERT')
+    ssl_key = os.getenv('SSL_KEY')
+    if ssl_cert and ssl_key:
+        ssl_context = (ssl_cert, ssl_key)
+        logger.info("SSL configured")
+    
     # Start the application
-    logger.info(f"Starting application on {host}:{port}")
+    logger.info(f"Starting application on {host}:{port} (Debug: {debug})")
     app.run(
         host=host,
         port=port,
-        debug=debug
+        debug=debug,
+        threaded=True,
+        ssl_context=ssl_context
     )
