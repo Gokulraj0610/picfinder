@@ -1,5 +1,5 @@
 flask==3.0.0
-flask-cors==4.0.0
+flask-cors==2.8.5
 gunicorn==21.2.0
 google-api-python-client==2.108.0
 google-auth-httplib2==0.1.1
@@ -9,4 +9,3 @@ numpy==1.24.3
 boto3==1.28.44
 python-dotenv==1.0.0
 werkzeug==3.0.0
-cors==2.8.5
