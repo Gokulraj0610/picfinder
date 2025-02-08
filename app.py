@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify, send_file, send_from_directory, Response
+# app.py
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from googleapiclient.discovery import build
@@ -18,14 +19,14 @@ from functools import lru_cache
 import time
 import math
 from typing import List, Dict, Any
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
-
-STATIC_FOLDER = 'static'
-if not os.path.exists(STATIC_FOLDER):
-    os.makedirs(STATIC_FOLDER)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -40,29 +41,34 @@ BATCH_SIZE = 5  # Size of each batch
 NUM_PARALLEL_BATCHES = 4  # Number of batches to process in parallel
 CACHE_TTL = 3600
 
-# Credentials configuration
+# Credentials should be stored in environment variables
 CREDENTIALS = {
     "type": "service_account",
-    "project_id": "picfinder-448616",
-    "private_key_id": "485873cadf1990eb7c6bcca600d3658b772d378c",
-    "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCwPcWzAUgD+Q3n\nTiggJfSgxN+g8ZNBWMBrG30c/24fub2HyVFN5ZF/Kt2R48VwOgQ1DGV92v5qkF23\naWTBCkZkiHLI5JZ3kiXxJn0LTpKrit9CThygGYWQx16Up/e5ULgKBP/K3KcoUS5I\nfiI/NE+acfyRuKPqt/Z139I+QMq1EEpyBsSpkogst526b4asw9IpGbLzMVUzPVXd\nE+zjbN6NaJcT3fSlJ3bJSMRYsQLza+0RkTXjF8dvn3P4jifnQPolu9old2D3/XfR\nvIeCVsS3F1t5isobytzggM2GR+1H/znDLx51gShgKbvbXulheNHD26S+Ll3jSVi6\nSmJ33v0DAgMBAAECgf8KZKY8ncn+kiak8Ua6O21VNKTJ2vcumPXRYIc/9DjIoM+n\n+qs4pRFzfyG2EOQf3wDv7P7S5Sf6OO3GhgNaTYXX2HnK58V/Li6csjXDAlcnRJaq\n8n+1nNptyWmCwJf2vD/Nvqn1J8L0IGOFkSGcGT9UKAmKs+uM0yrtO9865LjEdqMQ\nYQAu758S9cImZfZu+qb8I3Wky4W0XH3eyZyPtOIOfG6CLiW2oHJj/7oQVMDresFJ\nLBOX8uriqGRLkL76yugCbOkgeXWSkzLiVqcwUwj9a9JbBYJ9/AdWGPhKdKibfWBM\nKxurY9On5ZWGj9LCyS9I8WPwMxp+5oHvu00DkekCgYEA5l7u6XYvHsAxvU6Rlt7q\nLLkjXpHSBbD80vTU4e80AdtPxs7WlBWpglKGF9wH0p8E+ibXO1st+FKrzGAM4ma+\nzDBENdoyALqDUlvfS2NonpXOK3bfBgV58K/WBdUeEVYoFkMvps60HnsP1ASwegoU\niKzOL6W3+Z4ofUIyTQ/3XokCgYEAw9k0gDW/l8YwHTxUxOO++kGSBEN8olljq66N\nsznY5pJE6jJlPVeeN7tUxOdIL1DClHAcjRX5vCwCtWZb/sc7zSuMLENotx0+5pYU\n2LZUUAg8chOIzoJqieKekvCpL0LpZVeww/SmnYQLlTYWpq81nx3a5d06gr0uvZBb\n4jtaPCsCgYEAjoVS50p/klWzL/wIpD8avzp2wE4UkgLSFyzy+yhCk5d7vnI+XHUe\nXorxfJdam5pXuO8InyckxIlY0eLmdba8+ZQuzuZDoyHAltZRydEha2MgntE23wHK\nU/ZkwUz9Ahq8SDGerGMbGfRmcXPJPmc4FupZ0S6EKEEJqZyng/eJwYkCgYEAlBFH\nTBdWvtyry66tOB4naPTh/C85r1R9snLJ1tLJVakISTfIqtPvXptWv3dMb9lTAv6v\n10riAI4VjifRLZJbeAaQd3aPWMHXqGWXZTCUFd3kNSrnp5maCp023kjs4DpqUqA1\nmDEDNtt6FllKTsLwe1gLAvZ7IhT9nXviu+u7kPkCgYA0ICVX/t6AvKpChoEgy9dg\nUf/x5SKh9s45BL7lzF4iJaNDs1y/Cwlnx60If0pGPzYdFdo7xiXOM9SxLmkLGxkZ\n6dcipbbap4Ic7qKvTIBtJ7krNrI+qyFpdSSPW6r0TZ34pUMd6jVNdGUFLh6BZkI4\nGcEX+KjTH/V0dCJdUD0szw==\n-----END PRIVATE KEY-----\n",
-    "client_email": "picfinder@picfinder-448616.iam.gserviceaccount.com",
-    "client_id": "113805031804103548251",
+    "project_id": os.getenv('GOOGLE_PROJECT_ID'),
+    "private_key_id": os.getenv('GOOGLE_PRIVATE_KEY_ID'),
+    "private_key": os.getenv('GOOGLE_PRIVATE_KEY').replace('\\n', '\n'),
+    "client_email": os.getenv('GOOGLE_CLIENT_EMAIL'),
+    "client_id": os.getenv('GOOGLE_CLIENT_ID'),
     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
     "token_uri": "https://oauth2.googleapis.com/token",
     "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/picfinder%40picfinder-448616.iam.gserviceaccount.com",
-    "universe_domain": "googleapis.com",
-    "aws": {
-        "aws_access_key_id": "AKIAXNGUVMSJM4MAQPF3",
-        "aws_secret_access_key": "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",
-        "region": "us-east-1"
-    }
+    "client_x509_cert_url": os.getenv('GOOGLE_CLIENT_X509_CERT_URL'),
+    "universe_domain": "googleapis.com"
 }
 
-# Write credentials to file
-with open('credentials.json', 'w') as f:
-    json.dump(CREDENTIALS, f)
+# AWS credentials from environment variables
+AWS_CREDENTIALS = {
+    "aws_access_key_id": os.getenv('AWS_ACCESS_KEY_ID'),
+    "aws_secret_access_key": os.getenv('AWS_SECRET_ACCESS_KEY'),
+    "region": os.getenv('AWS_REGION', 'us-east-1')
+}
+
+# Write credentials to temporary file
+def create_credentials_file():
+    creds = {**CREDENTIALS, "aws": AWS_CREDENTIALS}
+    with open('temp_credentials.json', 'w') as f:
+        json.dump(creds, f)
+    return 'temp_credentials.json'
 
 # Initialize cache
 class ImageCache:
@@ -133,9 +139,22 @@ class OptimizedImageProcessor:
 
 def get_drive_service():
     if not hasattr(thread_local, "drive_service"):
-        credentials = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
+        creds_file = create_credentials_file()
+        credentials = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
         thread_local.drive_service = build('drive', 'v3', credentials=credentials)
+        # Clean up temporary credentials file
+        os.remove(creds_file)
     return thread_local.drive_service
+
+def get_rekognition_client():
+    if not hasattr(thread_local, "rekognition_client"):
+        thread_local.rekognition_client = boto3.client(
+            'rekognition',
+            aws_access_key_id=AWS_CREDENTIALS['aws_access_key_id'],
+            aws_secret_access_key=AWS_CREDENTIALS['aws_secret_access_key'],
+            region_name=AWS_CREDENTIALS['region']
+        )
+    return thread_local.rekognition_client
 
 def list_drive_images():
     try:
@@ -164,7 +183,7 @@ def process_single_comparison(source_bytes, drive_file, processor):
         target_bytes = fh.getvalue()
         optimized_target = processor.optimize_image(target_bytes)
         
-        comparison = rekognition_client.compare_faces(
+        comparison = get_rekognition_client().compare_faces(
             SourceImage={'Bytes': source_bytes},
             TargetImage={'Bytes': optimized_target},
             SimilarityThreshold=70
@@ -223,7 +242,7 @@ def process_image_stream(image_bytes):
     progress_queue = Queue()
     
     try:
-        source_response = rekognition_client.detect_faces(
+        source_response = get_rekognition_client().detect_faces(
             Image={'Bytes': optimized_source},
             Attributes=['DEFAULT']
         )
@@ -238,15 +257,13 @@ def process_image_stream(image_bytes):
         
         all_batches = [
             drive_images[i:i + BATCH_SIZE]
-            for i in range(0, len(drive_images),BATCH_SIZE)
+            for i in range(0, len(drive_images), BATCH_SIZE)
         ]
         
-        # Process batches in groups of NUM_PARALLEL_BATCHES
         for i in range(0, len(all_batches), NUM_PARALLEL_BATCHES):
             current_batches = all_batches[i:i + NUM_PARALLEL_BATCHES]
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_PARALLEL_BATCHES) as executor:
-                # Submit all batches for parallel processing
                 future_to_batch = {
                     executor.submit(
                         process_batch,
@@ -257,11 +274,9 @@ def process_image_stream(image_bytes):
                     ): batch for batch in current_batches
                 }
                 
-                # Track progress and yield results
                 pending_futures = set(future_to_batch.keys())
                 
                 while pending_futures:
-                    # Check progress queue
                     while not progress_queue.empty():
                         progress_queue.get()
                         processed += 1
@@ -272,7 +287,6 @@ def process_image_stream(image_bytes):
                                 'total': total_images
                             }
                     
-                    # Check for completed futures
                     done_futures, pending_futures = concurrent.futures.wait(
                         pending_futures,
                         timeout=0.1,
@@ -295,23 +309,7 @@ def process_image_stream(image_bytes):
         logger.error(f"Error in face comparison: {e}")
         yield {'type': 'error', 'message': str(e)}
 
-# Routes
-@app.route('/')
-def home():
-    return send_file('index.html')
-
-@app.route('/static/<path:path>')
-def send_static(path):
-    return send_from_directory('static', path)
-
-@app.route('/app.js')
-def serve_js():
-    return send_from_directory('.', 'app.js')
-
-@app.route('/styles.css')
-def serve_css():
-    return send_from_directory('.', 'styles.css')
-
+# API Routes
 @app.route('/set-folder-id', methods=['POST'])
 def set_folder_id():
     global DRIVE_FOLDER_ID
@@ -398,24 +396,96 @@ def serve_image(file_id):
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+# Initialize global variables
+# Initialize global variables
+DRIVE_FOLDER_ID = None
+
+# Error handler for all exceptions
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logger.error(f"Unhandled exception: {str(e)}")
+    return jsonify({
+        "error": "Internal server error",
+        "message": str(e)
+    }), 500
+
+# Healthcheck endpoint
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": time.time()
+    })
+
 # Initialize services
-try:
-    credentials = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
-    drive_service = build('drive', 'v3', credentials=credentials)
-    
-    aws_creds = json.load(open('credentials.json'))['aws']
-    rekognition_client = boto3.client('rekognition',
-        aws_access_key_id=aws_creds['aws_access_key_id'],
-        aws_secret_access_key=aws_creds['aws_secret_access_key'],
-        region_name=aws_creds['region']
+def init_services():
+    try:
+        # Create temporary credentials file
+        creds_file = create_credentials_file()
+        
+        # Initialize Google Drive service
+        global drive_service
+        credentials = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
+        drive_service = build('drive', 'v3', credentials=credentials)
+        
+        # Initialize AWS Rekognition client
+        global rekognition_client
+        rekognition_client = boto3.client(
+            'rekognition',
+            aws_access_key_id=AWS_CREDENTIALS['aws_access_key_id'],
+            aws_secret_access_key=AWS_CREDENTIALS['aws_secret_access_key'],
+            region_name=AWS_CREDENTIALS['region']
+        )
+        
+        # Clean up temporary credentials file
+        os.remove(creds_file)
+        
+        logger.info("Services initialized successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error during service initialization: {e}")
+        return False
+
+# Application startup configuration
+def configure_app():
+    # Set up logging format
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO
     )
     
-    DRIVE_FOLDER_ID = None
+    # Create necessary directories
+    os.makedirs('temp', exist_ok=True)
     
-except Exception as e:
-    logger.error(f"Error during initialization: {e}")
-    raise
+    # Initialize services
+    if not init_services():
+        logger.error("Failed to initialize services")
+        raise SystemExit("Application startup failed")
+    
+    # Set Flask configuration
+    app.config['MAX_CONTENT_LENGTH'] = MAX_IMAGE_SIZE
+    app.config['UPLOAD_FOLDER'] = 'temp'
+    
+    return app
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
-        
+    # Configure the application
+    app = configure_app()
+    
+    # Get port from environment variable or default to 5000
+    port = int(os.getenv('PORT', 5000))
+    
+    # Get host from environment variable or default to '0.0.0.0'
+    host = os.getenv('HOST', '0.0.0.0')
+    
+    # Get debug mode from environment variable
+    debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    
+    # Start the application
+    logger.info(f"Starting application on {host}:{port}")
+    app.run(
+        host=host,
+        port=port,
+        debug=debug
+    )
