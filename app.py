@@ -1,7 +1,8 @@
 # app.py
-from flask import Flask, request, jsonify, send_file, send_from_directory, Response
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response, make_response
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google.oauth2.service_account import Credentials
@@ -18,6 +19,9 @@ import numpy as np
 from functools import lru_cache
 import time
 import math
+import signal
+import sys
+import traceback
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 
@@ -27,13 +31,17 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
+# Add ProxyFix middleware
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
 # Enhanced CORS configuration with security headers
 CORS(app, 
      resources={
          r"/*": {
              "origins": [
                  "https://picfinder-develop.web.app",
-                 "http://localhost:3000"
+                 "http://localhost:3000",
+                 "https://picfinder-hwh8.onrender.com"
              ],
              "methods": ["GET", "POST", "OPTIONS"],
              "allow_headers": [
@@ -47,14 +55,14 @@ CORS(app,
                  "Content-Type", 
                  "Authorization",
                  "X-Total-Count",
-                 "X-Rate-Limit"
+                 "X-Rate-Limit",
+                 "Access-Control-Allow-Origin"
              ],
              "supports_credentials": True,
              "send_wildcard": False,
              "max_age": 86400
          }
-     },
-     intercept_exceptions=True)
+     })
 
 # Setup logging with more detailed configuration
 logging.basicConfig(
@@ -72,6 +80,7 @@ REKOGNITION_MAX_SIZE = 5 * 1024 * 1024  # 5MB AWS limit
 BATCH_SIZE = 5  # Size of each batch
 NUM_PARALLEL_BATCHES = 4  # Number of batches to process in parallel
 CACHE_TTL = 3600
+REQUEST_TIMEOUT = 30  # seconds
 
 # Credentials configuration
 CREDENTIALS = {
@@ -95,6 +104,31 @@ AWS_CREDENTIALS = {
     "region": os.getenv('AWS_REGION', 'us-east-1')
 }
 
+# CORS preflight handler
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept, Origin"
+        response.headers["Access-Control-Max-Age"] = "86400"
+        return response
+
+# Request timeout handler
+@app.before_request
+def timeout_handler():
+    if request.method != 'OPTIONS':
+        def timeout_error(*args, **kwargs):
+            raise TimeoutError('Request timeout')
+        signal.signal(signal.SIGALRM, timeout_error)
+        signal.alarm(REQUEST_TIMEOUT)
+
+@app.after_request
+def after_request(response):
+    signal.alarm(0)  # Disable the alarm
+    return response
+
 # Security headers middleware
 @app.after_request
 def add_security_headers(response):
@@ -104,6 +138,7 @@ def add_security_headers(response):
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Content-Security-Policy'] = "default-src 'self'"
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Access-Control-Allow-Origin'] = request.headers.get("Origin", "*")
     if hasattr(request, 'start_time'):
         response.headers['X-Response-Time'] = f"{(time.time() - request.start_time):.3f}s"
     return response
@@ -356,7 +391,7 @@ def process_image_stream(image_bytes):
                     
                     for future in done_futures:
                         try:
-                            batch_results = future.result()
+                             batch_results = future.result()
                             for result in batch_results:
                                 yield {
                                     'type': 'match',
@@ -404,7 +439,8 @@ def set_folder_id():
         
         if not data:
             return jsonify({
-                'status': 'error','message': 'No data provided'
+                'status': 'error',
+                'message': 'No data provided'
             }), 400
             
         folder_id = data.get('folderId')
@@ -601,6 +637,20 @@ def method_not_allowed_error(error):
     response.headers['X-Error-Code'] = 'METHOD_NOT_ALLOWED'
     return response, 405
 
+@app.errorhandler(408)
+def request_timeout_error(error):
+    logger.warning(f"408 error: {request.url}")
+    response = jsonify({
+        "status": "error",
+        "error": "Request Timeout",
+        "message": "The request took too long to process",
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'REQUEST_TIMEOUT'
+    return response, 408
+
 @app.errorhandler(413)
 def payload_too_large_error(error):
     logger.warning(f"413 error: {request.url}")
@@ -633,7 +683,8 @@ def too_many_requests_error(error):
 
 @app.errorhandler(500)
 def internal_error(error):
-    logger.error(f"500 error: {error}")
+    exc_info = sys.exc_info()
+    logger.error(f"500 error: {error}\nTraceback:\n{''.join(traceback.format_exception(*exc_info))}")
     response = jsonify({
         "status": "error",
         "error": "Internal Server Error",
@@ -644,6 +695,20 @@ def internal_error(error):
     })
     response.headers['X-Error-Code'] = 'INTERNAL_SERVER_ERROR'
     return response, 500
+
+@app.errorhandler(502)
+def bad_gateway_error(error):
+    logger.error(f"502 error: {error}")
+    response = jsonify({
+        "status": "error",
+        "error": "Bad Gateway",
+        "message": "The server received an invalid response from the upstream server",
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'BAD_GATEWAY'
+    return response, 502
 
 @app.errorhandler(503)
 def service_unavailable_error(error):
@@ -660,6 +725,20 @@ def service_unavailable_error(error):
     response.headers['X-Error-Code'] = 'SERVICE_UNAVAILABLE'
     response.headers['Retry-After'] = '300'
     return response, 503
+
+@app.errorhandler(TimeoutError)
+def timeout_error(error):
+    logger.error(f"Request timeout: {error}")
+    response = jsonify({
+        "status": "error",
+        "error": "Request Timeout",
+        "message": "The request took too long to process",
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'REQUEST_TIMEOUT'
+    return response, 408
 
 # Initialize global variables
 DRIVE_FOLDER_ID = None
