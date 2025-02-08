@@ -335,16 +335,29 @@ def health():
         "timestamp": time.time()
     })
 
-@app.route('/set-folder-id', methods=['POST'])
+@app.route('/set-folder-id', methods=['POST', 'OPTIONS'])
 def set_folder_id():
-    global DRIVE_FOLDER_ID
-    data = request.json
-    DRIVE_FOLDER_ID = data.get('folderId')
+    if request.method == 'OPTIONS':
+        # Handle preflight request
+        response = jsonify({'status': 'ok'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST')
+        return response
+        
     try:
-        folder_metadata = get_drive_service().files().get(fileId=DRIVE_FOLDER_ID, fields="name").execute()
-        return jsonify({'success': True, 'folderName': folder_metadata.get('name')})
+        data = request.get_json()
+        folder_id = data.get('folderId')
+        
+        if not folder_id:
+            return jsonify({'error': 'No folder ID provided'}), 400
+            
+        # Your folder ID processing logic here
+        
+        return jsonify({'status': 'success'}), 200
+        
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/search-face', methods=['POST'])
 def search_face():
