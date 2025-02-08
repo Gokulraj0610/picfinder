@@ -27,7 +27,7 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
-# Enhanced CORS configuration
+# Enhanced CORS configuration with security headers
 CORS(app, 
      resources={
          r"/*": {
@@ -36,8 +36,19 @@ CORS(app,
                  "http://localhost:3000"
              ],
              "methods": ["GET", "POST", "OPTIONS"],
-             "allow_headers": ["Content-Type", "Authorization"],
-             "expose_headers": ["Content-Type", "Authorization"],
+             "allow_headers": [
+                 "Content-Type", 
+                 "Authorization",
+                 "X-Requested-With",
+                 "Accept",
+                 "Origin"
+             ],
+             "expose_headers": [
+                 "Content-Type", 
+                 "Authorization",
+                 "X-Total-Count",
+                 "X-Rate-Limit"
+             ],
              "supports_credentials": True,
              "send_wildcard": False,
              "max_age": 86400
@@ -83,6 +94,36 @@ AWS_CREDENTIALS = {
     "aws_secret_access_key": os.getenv('AWS_SECRET_ACCESS_KEY'),
     "region": os.getenv('AWS_REGION', 'us-east-1')
 }
+
+# Security headers middleware
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    if hasattr(request, 'start_time'):
+        response.headers['X-Response-Time'] = f"{(time.time() - request.start_time):.3f}s"
+    return response
+
+# Request validation middleware
+@app.before_request
+def before_request():
+    request.start_time = time.time()
+    if request.method == 'POST':
+        if not request.content_type:
+            return jsonify({
+                'status': 'error',
+                'message': 'Content-Type header is required'
+            }), 400
+        if 'multipart/form-data' not in request.content_type and \
+           'application/json' not in request.content_type:
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid Content-Type'
+            }), 415
 
 # Initialize cache
 class ImageCache:
@@ -363,8 +404,7 @@ def set_folder_id():
         
         if not data:
             return jsonify({
-                'status': 'error',
-                'message': 'No data provided'
+                'status': 'error','message': 'No data provided'
             }), 400
             
         folder_id = data.get('folderId')
@@ -490,87 +530,136 @@ def allowed_file(filename):
     """Check if the file extension is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Error handlers with enhanced logging and consistent response format
+# Enhanced error handlers
 @app.errorhandler(400)
 def bad_request_error(error):
     logger.warning(f"400 error: {request.url} - {error}")
-    return jsonify({
+    response = jsonify({
         "status": "error",
         "error": "Bad Request",
         "message": str(error),
-        "path": request.path
-    }), 400
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'BAD_REQUEST'
+    return response, 400
+
+@app.errorhandler(401)
+def unauthorized_error(error):
+    logger.warning(f"401 error: {request.url}")
+    response = jsonify({
+        "status": "error",
+        "error": "Unauthorized",
+        "message": "Authentication is required",
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'UNAUTHORIZED'
+    return response, 401
+
+@app.errorhandler(403)
+def forbidden_error(error):
+    logger.warning(f"403 error: {request.url}")
+    response = jsonify({
+        "status": "error",
+        "error": "Forbidden",
+        "message": "You don't have permission to access this resource",
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'FORBIDDEN'
+    return response, 403
 
 @app.errorhandler(404)
 def not_found_error(error):
     logger.warning(f"404 error: {request.url}")
-    return jsonify({
+    response = jsonify({
         "status": "error",
         "error": "Not Found",
         "message": "The requested resource was not found",
-        "path": request.path
-    }), 404
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'NOT_FOUND'
+    return response, 404
 
 @app.errorhandler(405)
 def method_not_allowed_error(error):
     logger.warning(f"405 error: {request.url} - {request.method}")
-    return jsonify({
+    response = jsonify({
         "status": "error",
         "error": "Method Not Allowed",
         "message": f"The {request.method} method is not allowed for this endpoint",
-        "path": request.path
-    }), 405
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'METHOD_NOT_ALLOWED'
+    return response, 405
 
 @app.errorhandler(413)
 def payload_too_large_error(error):
     logger.warning(f"413 error: {request.url}")
-    return jsonify({
+    response = jsonify({
         "status": "error",
         "error": "Payload Too Large",
         "message": "The uploaded file exceeds the maximum allowed size",
-        "path": request.path
-    }), 413
-
-@app.errorhandler(415)
-def unsupported_media_type_error(error):
-    logger.warning(f"415 error: {request.url}")
-    return jsonify({
-        "status": "error",
-        "error": "Unsupported Media Type",
-        "message": "The provided content type is not supported",
-        "path": request.path
-    }), 415
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'PAYLOAD_TOO_LARGE'
+    return response, 413
 
 @app.errorhandler(429)
 def too_many_requests_error(error):
     logger.warning(f"429 error: {request.url}")
-    return jsonify({
+    response = jsonify({
         "status": "error",
         "error": "Too Many Requests",
         "message": "Rate limit exceeded. Please try again later",
-        "path": request.path
-    }), 429
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown'),
+        "retry_after": 60
+    })
+    response.headers['X-Error-Code'] = 'TOO_MANY_REQUESTS'
+    response.headers['Retry-After'] = '60'
+    return response, 429
 
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"500 error: {error}")
-    return jsonify({
+    response = jsonify({
         "status": "error",
         "error": "Internal Server Error",
         "message": "An unexpected error occurred",
-        "details": str(error) if app.debug else None,
-        "path": request.path
-    }), 500
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown')
+    })
+    response.headers['X-Error-Code'] = 'INTERNAL_SERVER_ERROR'
+    return response, 500
 
 @app.errorhandler(503)
 def service_unavailable_error(error):
     logger.error(f"503 error: {error}")
-    return jsonify({
+    response = jsonify({
         "status": "error",
         "error": "Service Unavailable",
         "message": "The service is temporarily unavailable",
-        "path": request.path
-    }), 503
+        "path": request.path,
+        "timestamp": time.time(),
+        "request_id": request.headers.get('X-Request-ID', 'unknown'),
+        "retry_after": 300
+    })
+    response.headers['X-Error-Code'] = 'SERVICE_UNAVAILABLE'
+    response.headers['Retry-After'] = '300'
+    return response, 503
 
 # Initialize global variables
 DRIVE_FOLDER_ID = None
@@ -616,12 +705,13 @@ if __name__ == '__main__':
         ssl_context = (ssl_cert, ssl_key)
         logger.info("SSL configured")
     
-    # Start the application
+    # Start the application with enhanced security
     logger.info(f"Starting application on {host}:{port} (Debug: {debug})")
     app.run(
         host=host,
         port=port,
         debug=debug,
         threaded=True,
-        ssl_context=ssl_context
+        ssl_context=ssl_context,
+        use_reloader=debug
     )
