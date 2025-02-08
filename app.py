@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from googleapiclient.discovery import build
@@ -26,7 +26,14 @@ load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={
+    r"/*": {
+        "origins": ["https://picfinder-develop.web.app", "http://localhost:3000"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True
+    }
+})
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +48,7 @@ BATCH_SIZE = 5  # Size of each batch
 NUM_PARALLEL_BATCHES = 4  # Number of batches to process in parallel
 CACHE_TTL = 3600
 
-# Credentials should be stored in environment variables
+# Credentials configuration
 CREDENTIALS = {
     "type": "service_account",
     "project_id": os.getenv('GOOGLE_PROJECT_ID'),
@@ -63,12 +70,16 @@ AWS_CREDENTIALS = {
     "region": os.getenv('AWS_REGION', 'us-east-1')
 }
 
-# Write credentials to temporary file
-def create_credentials_file():
-    creds = {**CREDENTIALS, "aws": AWS_CREDENTIALS}
-    with open('temp_credentials.json', 'w') as f:
-        json.dump(creds, f)
-    return 'temp_credentials.json'
+# Add CORS headers for all responses
+@app.after_request
+def after_request(response):
+    origin = request.headers.get('Origin')
+    if origin in ['https://picfinder-develop.web.app', 'http://localhost:3000']:
+        response.headers.add('Access-Control-Allow-Origin', origin)
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+        response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
 
 # Initialize cache
 class ImageCache:
@@ -139,11 +150,8 @@ class OptimizedImageProcessor:
 
 def get_drive_service():
     if not hasattr(thread_local, "drive_service"):
-        creds_file = create_credentials_file()
-        credentials = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
+        credentials = Credentials.from_service_account_info(CREDENTIALS, scopes=SCOPES)
         thread_local.drive_service = build('drive', 'v3', credentials=credentials)
-        # Clean up temporary credentials file
-        os.remove(creds_file)
     return thread_local.drive_service
 
 def get_rekognition_client():
@@ -224,7 +232,7 @@ def process_batch(batch, optimized_source, processor, progress_queue):
         }
         
         for future in concurrent.futures.as_completed(future_to_file):
-            progress_queue.put(1)  # Increment progress counter
+            progress_queue.put(1)
             try:
                 result = future.result()
                 if result:
@@ -310,6 +318,23 @@ def process_image_stream(image_bytes):
         yield {'type': 'error', 'message': str(e)}
 
 # API Routes
+@app.route('/')
+def root():
+    """Root endpoint for health checks"""
+    return jsonify({
+        "status": "online",
+        "service": "PicFinder API",
+        "timestamp": time.time()
+    })
+
+@app.route('/health')
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": time.time()
+    })
+
 @app.route('/set-folder-id', methods=['POST'])
 def set_folder_id():
     global DRIVE_FOLDER_ID
@@ -396,36 +421,30 @@ def serve_image(file_id):
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Initialize global variables
-# Initialize global variables
-DRIVE_FOLDER_ID = None
-
-# Error handler for all exceptions
-@app.errorhandler(Exception)
-def handle_exception(e):
-    logger.error(f"Unhandled exception: {str(e)}")
+# Error handlers
+@app.errorhandler(404)
+def not_found_error(error):
     return jsonify({
-        "error": "Internal server error",
-        "message": str(e)
+        "error": "Not Found",
+        "message": "The requested resource was not found"
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        "error": "Internal Server Error",
+        "message": str(error)
     }), 500
 
-# Healthcheck endpoint
-@app.route('/health')
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": time.time()
-    })
+# Initialize global variable
+DRIVE_FOLDER_ID = None
 
 # Initialize services
 def init_services():
     try:
-        # Create temporary credentials file
-        creds_file = create_credentials_file()
-        
         # Initialize Google Drive service
         global drive_service
-        credentials = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
+        credentials = Credentials.from_service_account_info(CREDENTIALS, scopes=SCOPES)
         drive_service = build('drive', 'v3', credentials=credentials)
         
         # Initialize AWS Rekognition client
@@ -437,9 +456,6 @@ def init_services():
             region_name=AWS_CREDENTIALS['region']
         )
         
-        # Clean up temporary credentials file
-        os.remove(creds_file)
-        
         logger.info("Services initialized successfully")
         return True
         
@@ -447,31 +463,11 @@ def init_services():
         logger.error(f"Error during service initialization: {e}")
         return False
 
-# Application startup configuration
-def configure_app():
-    # Set up logging format
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
-    )
-    
-    # Create necessary directories
-    os.makedirs('temp', exist_ok=True)
-    
+if __name__ == '__main__':
     # Initialize services
     if not init_services():
         logger.error("Failed to initialize services")
         raise SystemExit("Application startup failed")
-    
-    # Set Flask configuration
-    app.config['MAX_CONTENT_LENGTH'] = MAX_IMAGE_SIZE
-    app.config['UPLOAD_FOLDER'] = 'temp'
-    
-    return app
-
-if __name__ == '__main__':
-    # Configure the application
-    app = configure_app()
     
     # Get port from environment variable or default to 5000
     port = int(os.getenv('PORT', 5000))
