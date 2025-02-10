@@ -207,11 +207,10 @@ image_cache = ImageCache()
 thread_local = threading.local()
 
 class OptimizedImageProcessor:
-    def __init__(self, max_workers=2):  # Reduced from 4 to 2
+    def __init__(self, max_workers=2):
         self.max_workers = max_workers
-        self.process_queue = Queue(maxsize=10)  # Add queue size limit
-        self.results = []
-        self.thread_pool = concurrent.futures.ThreadPoolExecutor(
+        self.process_queue = Queue(maxsize=5)  # Reduce queue size
+        self.thread_pool = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix='img_processor'
         )
@@ -219,47 +218,37 @@ class OptimizedImageProcessor:
     @staticmethod
     def optimize_image(img_bytes, target_size=(800, 800), quality=85):
         try:
-            # Create image object with maximum pixel limit
-            MAX_PIXELS = 4096 * 4096  # Limit maximum image size
-            img = Image.open(io.BytesIO(img_bytes))
-            
-            # Check image size and reduce if necessary
-            if (img.size[0] * img.size[1]) > MAX_PIXELS:
-                ratio = math.sqrt(MAX_PIXELS / (img.size[0] * img.size[1]))
-                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-                img = img.resize(new_size, Image.LANCZOS)
-            
-            # Convert RGBA to RGB to reduce memory
-            if img.mode in ('RGBA', 'LA'):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[-1])
-                img = background
-            
-            # Optimize size
-            aspect = img.size[0] / img.size[1]
-            if aspect > 1:
-                new_size = (min(target_size[0], img.size[0]), 
-                          min(int(target_size[1] / aspect), img.size[1]))
-            else:
-                new_size = (min(int(target_size[0] * aspect), img.size[0]), 
-                          min(target_size[1], img.size[1]))
-            
-            img = img.resize(new_size, Image.LANCZOS)
-            
-            # Save with optimization
-            output = io.BytesIO()
-            img.save(output, format='JPEG', quality=quality, optimize=True)
-            
-            # Clear memory
-            img.close()
-            return output.getvalue()
-            
+            with Image.open(io.BytesIO(img_bytes)) as img:
+                # Set maximum image dimensions
+                MAX_WIDTH = 1024
+                MAX_HEIGHT = 1024
+                
+                if img.width > MAX_WIDTH or img.height > MAX_HEIGHT:
+                    ratio = min(MAX_WIDTH/img.width, MAX_HEIGHT/img.height)
+                    new_size = (
+                        int(img.width * ratio),
+                        int(img.height * ratio)
+                    )
+                    img = img.resize(new_size, Image.LANCZOS)
+                
+                # Convert to RGB to reduce memory
+                if img.mode in ('RGBA', 'LA'):
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[-1])
+                    img = background
+                
+                output = io.BytesIO()
+                img.save(
+                    output,
+                    format='JPEG',
+                    quality=quality,
+                    optimize=True
+                )
+                return output.getvalue()
+                
         except Exception as e:
             logger.error(f"Image optimization error: {str(e)}")
             raise
-        finally:
-            if 'img' in locals():
-                img.close()
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -525,56 +514,37 @@ def set_folder_id():
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit upload size to 16MB
 
 @app.route('/search-face', methods=['POST'])
+@manage_memory
 def search_face():
     try:
-        # Check if file was uploaded in the request
-        if 'file' not in request.files:
-            return jsonify({
-                'status': 'error',
-                'message': 'No file provided'
-            }), 400
-
         file = request.files['file']
+        chunk_size = 1024 * 1024  # 1MB chunks
         
-        # Check if a file was selected
-        if file.filename == '':
-            return jsonify({
-                'status': 'error',
-                'message': 'No file selected'
-            }), 400
-
-        # Validate file type
-        if not allowed_file(file.filename):
-            return jsonify({
-                'status': 'error',
-                'message': 'Invalid file type. Allowed types are: ' + ', '.join(ALLOWED_EXTENSIONS)
-            }), 400
-
-        # Read the file into memory
-        image_bytes = file.read()
+        # Stream the file in chunks
+        chunks = []
+        while True:
+            chunk = file.read(chunk_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
         
-        # Check file size
-        if len(image_bytes) > MAX_IMAGE_SIZE:
-            return jsonify({
-                'status': 'error',
-                'message': f'File size exceeds maximum limit of {MAX_IMAGE_SIZE / (1024 * 1024)}MB'
-            }), 413
-
-        # Process the image stream and return results
+        image_bytes = b''.join(chunks)
+        
+        # Process image in smaller batches
+        processor = OptimizedImageProcessor(max_workers=2)  # Reduce workers
         return Response(
             stream_results(process_image_stream(image_bytes)),
             mimetype='application/x-ndjson'
         )
-
     except Exception as e:
-        # Log error and clean up
         logger.error(f"Error processing image: {str(e)}")
-        gc.collect()  # Force garbage collection
+        gc.collect()
         return jsonify({
             'status': 'error',
             'message': 'Image processing failed',
             'error': str(e)
         }), 500
+
 
 @app.route('/image/<file_id>')
 def serve_image(file_id):
@@ -638,6 +608,18 @@ def serve_image(file_id):
 def allowed_file(filename):
     """Check if the file extension is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def manage_memory(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+            gc.collect()  # Force garbage collection
+            return result
+        except Exception as e:
+            gc.collect()
+            raise e
+    return wrapper
 
 def cleanup_temporary_files():
     temp_dir = "path/to/temp/directory"
