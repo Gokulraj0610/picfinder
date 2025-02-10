@@ -391,7 +391,7 @@ def process_image_stream(image_bytes):
                     
                     for future in done_futures:
                         try:
-                             batch_results = future.result()
+                            batch_results = future.result()
                             for result in batch_results:
                                 yield {
                                     'type': 'match',
@@ -794,3 +794,5 @@ if __name__ == '__main__':
         ssl_context=ssl_context,
         use_reloader=debug
     )
+
+                             
