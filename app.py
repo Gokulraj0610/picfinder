@@ -527,26 +527,54 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit upload size to 16MB
 @app.route('/search-face', methods=['POST'])
 def search_face():
     try:
-        # After finding the image
-        image_data = process_image_stream(image_bytes)  # Your image processing function
+        # Check if file was uploaded in the request
+        if 'file' not in request.files:
+            return jsonify({
+                'status': 'error',
+                'message': 'No file provided'
+            }), 400
+
+        file = request.files['file']
         
-        # Send image and clear memory
-        response = make_response(send_file(
-            io.BytesIO(image_data),
-            mimetype='image/jpeg'
-        ))
+        # Check if a file was selected
+        if file.filename == '':
+            return jsonify({
+                'status': 'error',
+                'message': 'No file selected'
+            }), 400
+
+        # Validate file type
+        if not allowed_file(file.filename):
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid file type. Allowed types are: ' + ', '.join(ALLOWED_EXTENSIONS)
+            }), 400
+
+        # Read the file into memory
+        image_bytes = file.read()
         
-        # Clear memory explicitly
-        image_data = None
-        gc.collect()  # Force garbage collection
-        
-        return response
-        
+        # Check file size
+        if len(image_bytes) > MAX_IMAGE_SIZE:
+            return jsonify({
+                'status': 'error',
+                'message': f'File size exceeds maximum limit of {MAX_IMAGE_SIZE / (1024 * 1024)}MB'
+            }), 413
+
+        # Process the image stream and return results
+        return Response(
+            stream_results(process_image_stream(image_bytes)),
+            mimetype='application/x-ndjson'
+        )
+
     except Exception as e:
         # Log error and clean up
-        logging.error(f"Error processing image: {str(e)}")
-        gc.collect()
-        return jsonify({'error': 'Image processing failed'}), 500
+        logger.error(f"Error processing image: {str(e)}")
+        gc.collect()  # Force garbage collection
+        return jsonify({
+            'status': 'error',
+            'message': 'Image processing failed',
+            'error': str(e)
+        }), 500
 
 @app.route('/image/<file_id>')
 def serve_image(file_id):
