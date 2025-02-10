@@ -9,3 +9,4 @@ numpy==1.24.3
 boto3==1.28.44
 python-dotenv==1.0.0
 werkzeug==3.0.0
+psutil==5.9.8
