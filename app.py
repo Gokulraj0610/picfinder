@@ -24,6 +24,10 @@ import sys
 import traceback
 from typing import List, Dict, Any
 from dotenv import load_dotenv
+import resource
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import psutil
 
 # Load environment variables
 load_dotenv()
@@ -63,6 +67,12 @@ CORS(app,
              "max_age": 86400
          }
      })
+
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
 
 # Setup logging with more detailed configuration
 logging.basicConfig(
@@ -104,6 +114,10 @@ AWS_CREDENTIALS = {
     "region": os.getenv('AWS_REGION', 'us-east-1')
 }
 
+def log_memory_usage():
+    process = psutil.Process()
+    logger.info(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
 # CORS preflight handler
 @app.before_request
 def handle_preflight():
@@ -141,6 +155,12 @@ def add_security_headers(response):
     response.headers['Access-Control-Allow-Origin'] = request.headers.get("Origin", "*")
     if hasattr(request, 'start_time'):
         response.headers['X-Response-Time'] = f"{(time.time() - request.start_time):.3f}s"
+    return response
+
+@app.after_request
+def cleanup_memory(response):
+    import gc
+    gc.collect()
     return response
 
 # Request validation middleware
@@ -186,38 +206,59 @@ image_cache = ImageCache()
 thread_local = threading.local()
 
 class OptimizedImageProcessor:
-    def __init__(self, max_workers=4):
+    def __init__(self, max_workers=2):  # Reduced from 4 to 2
         self.max_workers = max_workers
-        self.process_queue = Queue()
+        self.process_queue = Queue(maxsize=10)  # Add queue size limit
         self.results = []
-        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        self.processed_hashes = set()
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix='img_processor'
+        )
         
     @staticmethod
     def optimize_image(img_bytes, target_size=(800, 800), quality=85):
         try:
+            # Create image object with maximum pixel limit
+            MAX_PIXELS = 4096 * 4096  # Limit maximum image size
             img = Image.open(io.BytesIO(img_bytes))
             
+            # Check image size and reduce if necessary
+            if (img.size[0] * img.size[1]) > MAX_PIXELS:
+                ratio = math.sqrt(MAX_PIXELS / (img.size[0] * img.size[1]))
+                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+            
+            # Convert RGBA to RGB to reduce memory
             if img.mode in ('RGBA', 'LA'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 background.paste(img, mask=img.split()[-1])
                 img = background
             
+            # Optimize size
             aspect = img.size[0] / img.size[1]
             if aspect > 1:
-                new_size = (target_size[0], int(target_size[1] / aspect))
+                new_size = (min(target_size[0], img.size[0]), 
+                          min(int(target_size[1] / aspect), img.size[1]))
             else:
-                new_size = (int(target_size[0] * aspect), target_size[1])
+                new_size = (min(int(target_size[0] * aspect), img.size[0]), 
+                          min(target_size[1], img.size[1]))
             
             img = img.resize(new_size, Image.LANCZOS)
             
+            # Save with optimization
             output = io.BytesIO()
-            img.save(output, format='JPEG', quality=quality, optimize=True, progressive=True)
+            img.save(output, format='JPEG', quality=quality, optimize=True)
+            
+            # Clear memory
+            img.close()
             return output.getvalue()
             
         except Exception as e:
             logger.error(f"Image optimization error: {str(e)}")
-            raise Exception(f"Image optimization failed: {str(e)}")
+            raise
+        finally:
+            if 'img' in locals():
+                img.close()
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -767,6 +808,8 @@ def init_services():
 
 if __name__ == '__main__':
     # Initialize services
+    
+    resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 512, -1)) 
     if not init_services():
         logger.critical("Failed to initialize services")
         raise SystemExit("Application startup failed")
