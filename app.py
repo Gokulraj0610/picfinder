@@ -40,12 +40,11 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 CORS(app, 
      resources={
          r"/*": {
-             "origins": "*",  # More permissive during development
+             "origins": ["http://localhost:3000", "https://picfinder-hwh8.onrender.com"],  # Specify actual domains
              "methods": ["GET", "POST", "OPTIONS"],
-             "allow_headers": ["*"],  # More permissive during development
-             "expose_headers": ["*"],  # More permissive during development
+             "allow_headers": ["Content-Type", "Authorization"],
+             "expose_headers": ["Content-Range", "X-Content-Range"],
              "supports_credentials": True,
-             "send_wildcard": True,
              "max_age": 86400
          }
      })
