@@ -1,12 +1,36 @@
+# Web Framework and Extensions
 flask==3.0.0
 flask-cors==4.0.2
+werkzeug==3.0.0
 gunicorn==21.2.0
+
+# Google API Dependencies
 google-api-python-client==2.108.0
 google-auth-httplib2==0.1.1
 google-auth-oauthlib==1.1.0
+oauth2client==3.0.0  # Added for file_cache support
+
+# Image Processing
 pillow==10.0.0
 numpy==1.24.3
+
+# AWS Integration
 boto3==1.28.44
+
+# Utilities
 python-dotenv==1.0.0
-werkzeug==3.0.0
 psutil==5.9.8
+
+# Additional dependencies for compatibility
+httplib2>=0.20.4
+pyasn1>=0.4.8
+pyasn1-modules>=0.2.8
+rsa>=4.7.2
+six>=1.16.0
+urllib3<2.0.0  # Added for boto3 compatibility
+
+# Installation Instructions:
+# 1. Save this as requirements.txt
+# 2. (Optional) Create and activate a virtual environment
+# 3. Run: pip install -r requirements.txt
+# 4. Restart your application
