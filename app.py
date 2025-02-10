@@ -28,7 +28,7 @@ import resource
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import psutil
-
+import gc
 # Load environment variables
 load_dotenv()
 
@@ -527,7 +527,7 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit upload size to 16MB
 def search_face():
     try:
         # After finding the image
-        image_data = process_image()  # Your image processing function
+        image_data = process_image_stream()  # Your image processing function
         
         # Send image and clear memory
         response = make_response(send_file(
