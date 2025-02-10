@@ -22,6 +22,8 @@ import math
 import signal
 import sys
 import traceback
+import gc
+import psutil
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 
@@ -38,28 +40,12 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 CORS(app, 
      resources={
          r"/*": {
-             "origins": [
-                 "https://picfinder-develop.web.app",
-                 "http://localhost:3000",
-                 "https://picfinder-hwh8.onrender.com"
-             ],
+             "origins": "*",  # More permissive during development
              "methods": ["GET", "POST", "OPTIONS"],
-             "allow_headers": [
-                 "Content-Type", 
-                 "Authorization",
-                 "X-Requested-With",
-                 "Accept",
-                 "Origin"
-             ],
-             "expose_headers": [
-                 "Content-Type", 
-                 "Authorization",
-                 "X-Total-Count",
-                 "X-Rate-Limit",
-                 "Access-Control-Allow-Origin"
-             ],
+             "allow_headers": ["*"],  # More permissive during development
+             "expose_headers": ["*"],  # More permissive during development
              "supports_credentials": True,
-             "send_wildcard": False,
+             "send_wildcard": True,
              "max_age": 86400
          }
      })
@@ -77,10 +63,16 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.readonly']
 MAX_IMAGE_SIZE = 15 * 1024 * 1024  # 15MB
 REKOGNITION_MAX_SIZE = 5 * 1024 * 1024  # 5MB AWS limit
-BATCH_SIZE = 5  # Size of each batch
-NUM_PARALLEL_BATCHES = 4  # Number of batches to process in parallel
+BATCH_SIZE = 3  # Reduced from 5
+NUM_PARALLEL_BATCHES = 2  # Reduced from 4
 CACHE_TTL = 3600
 REQUEST_TIMEOUT = 30  # seconds
+DOWNLOAD_TIMEOUT = 30  # seconds
+
+# Memory monitoring function
+def log_memory_usage():
+    process = psutil.Process(os.getpid())
+    logger.info(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
 # Credentials configuration
 CREDENTIALS = {
@@ -109,9 +101,9 @@ AWS_CREDENTIALS = {
 def handle_preflight():
     if request.method == "OPTIONS":
         response = make_response()
-        response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept, Origin"
+        response.headers["Access-Control-Allow-Headers"] = "*"
         response.headers["Access-Control-Max-Age"] = "86400"
         return response
 
@@ -138,27 +130,10 @@ def add_security_headers(response):
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Content-Security-Policy'] = "default-src 'self'"
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Access-Control-Allow-Origin'] = request.headers.get("Origin", "*")
+    response.headers['Access-Control-Allow-Origin'] = "*"
     if hasattr(request, 'start_time'):
         response.headers['X-Response-Time'] = f"{(time.time() - request.start_time):.3f}s"
     return response
-
-# Request validation middleware
-@app.before_request
-def before_request():
-    request.start_time = time.time()
-    if request.method == 'POST':
-        if not request.content_type:
-            return jsonify({
-                'status': 'error',
-                'message': 'Content-Type header is required'
-            }), 400
-        if 'multipart/form-data' not in request.content_type and \
-           'application/json' not in request.content_type:
-            return jsonify({
-                'status': 'error',
-                'message': 'Invalid Content-Type'
-            }), 415
 
 # Initialize cache
 class ImageCache:
@@ -273,7 +248,10 @@ def process_single_comparison(source_bytes, drive_file, processor):
         downloader = MediaIoBaseDownload(fh, request)
         
         done = False
+        start_time = time.time()
         while not done:
+            if time.time() - start_time > DOWNLOAD_TIMEOUT:
+                raise TimeoutError("Download timeout")
             status, done = downloader.next_chunk()
         
         target_bytes = fh.getvalue()
@@ -298,6 +276,7 @@ def process_single_comparison(source_bytes, drive_file, processor):
     finally:
         if 'fh' in locals():
             fh.close()
+        gc.collect()  # Force garbage collection
     
     return None
 
@@ -309,25 +288,28 @@ def stream_results(generator):
 def process_batch(batch, optimized_source, processor, progress_queue):
     """Process a batch of images and return results"""
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
-        future_to_file = {
-            executor.submit(
-                process_single_comparison,
-                optimized_source,
-                drive_file,
-                processor
-            ): drive_file for drive_file in batch
-        }
-        
-        for future in concurrent.futures.as_completed(future_to_file):
-            progress_queue.put(1)
-            try:
-                result = future.result()
-                if result:
-                    results.append(result)
-            except Exception as e:
-                logger.error(f"Error in batch comparison: {e}")
-                continue
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
+            future_to_file = {
+                executor.submit(
+                    process_single_comparison,
+                    optimized_source,
+                    drive_file,
+                    processor
+                ): drive_file for drive_file in batch
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_file):
+                progress_queue.put(1)
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"Error in batch comparison: {e}")
+                    continue
+    finally:
+        gc.collect()  # Force garbage collection after batch processing
                 
     return results
 
@@ -404,84 +386,12 @@ def process_image_stream(image_bytes):
     except Exception as e:
         logger.error(f"Error in face comparison: {e}")
         yield {'type': 'error', 'message': str(e)}
-
-# API Routes
-@app.route('/')
-def root():
-    """Root endpoint for health checks"""
-    return jsonify({
-        "status": "online",
-        "service": "PicFinder API",
-        "timestamp": time.time()
-    })
-
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "healthy",
-        "timestamp": time.time()
-    })
-
-@app.route('/set-folder-id', methods=['POST', 'OPTIONS'])
-def set_folder_id():
-    try:
-        if request.method == 'OPTIONS':
-            return '', 204  # Respond to preflight request
-            
-        if not request.is_json:
-            return jsonify({
-                'status': 'error',
-                'message': 'Content-Type must be application/json'
-            }), 415
-
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({
-                'status': 'error',
-                'message': 'No data provided'
-            }), 400
-            
-        folder_id = data.get('folderId')
-        
-        if not folder_id:
-            return jsonify({
-                'status': 'error',
-                'message': 'No folder ID provided'
-            }), 400
-
-        # Validate folder ID exists in Drive
-        try:
-            drive_service = get_drive_service()
-            drive_service.files().get(fileId=folder_id).execute()
-        except Exception as e:
-            logger.error(f"Invalid folder ID: {e}")
-            return jsonify({
-                'status': 'error',
-                'message': 'Invalid folder ID'
-            }), 400
-            
-        global DRIVE_FOLDER_ID
-        DRIVE_FOLDER_ID = folder_id
-        
-        response = jsonify({
-            'status': 'success',
-            'message': 'Folder ID set successfully',
-            'folderId': folder_id
-        })
-        
-        return response, 200
-        
-    except Exception as e:
-        logger.error(f"Error in set_folder_id: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+    finally:
+        gc.collect()  # Force garbage collection
 
 @app.route('/search-face', methods=['POST'])
 def search_face():
+    log_memory_usage()  # Log memory usage at start
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
 
@@ -494,6 +404,7 @@ def search_face():
         if len(image_bytes) > MAX_IMAGE_SIZE:
             return jsonify({'error': 'Image size must be less than 15MB'}), 400
 
+        log_memory_usage()  # Log memory usage before processing
         return Response(
             stream_results(process_image_stream(image_bytes)),
             mimetype='application/x-ndjson'
@@ -502,6 +413,9 @@ def search_face():
     except Exception as e:
         logger.error(f"Error in search_face: {e}")
         return jsonify({'error': str(e)}), 500
+    finally:
+        log_memory_usage()  # Log memory usage after completion
+        gc.collect()  # Force garbage collection
 
 @app.route('/image/<file_id>')
 def serve_image(file_id):
@@ -520,7 +434,10 @@ def serve_image(file_id):
         downloader = MediaIoBaseDownload(fh, request)
         
         done = False
+        start_time = time.time()
         while not done:
+            if time.time() - start_time > DOWNLOAD_TIMEOUT:
+                raise TimeoutError("Download timeout")
             status, done = downloader.next_chunk()
         
         fh.seek(0)
@@ -561,6 +478,63 @@ def serve_image(file_id):
                 fh.close()
             except:
                 pass
+        gc.collect()  # Force garbage collection
+
+@app.route('/set-folder-id', methods=['POST', 'OPTIONS'])
+def set_folder_id():
+    try:
+        if request.method == 'OPTIONS':
+            return '', 204
+            
+        if not request.is_json:
+            return jsonify({
+                'status': 'error',
+                'message': 'Content-Type must be application/json'
+            }), 415
+
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'status': 'error',
+                'message': 'No data provided'
+            }), 400
+            
+        folder_id = data.get('folderId')
+        
+        if not folder_id:
+            return jsonify({
+                'status': 'error',
+                'message': 'No folder ID provided'
+            }), 400
+
+        try:
+            drive_service = get_drive_service()
+            drive_service.files().get(fileId=folder_id).execute()
+        except Exception as e:
+            logger.error(f"Invalid folder ID: {e}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid folder ID'
+            }), 400
+            
+        global DRIVE_FOLDER_ID
+        DRIVE_FOLDER_ID = folder_id
+        
+        response = jsonify({
+            'status': 'success',
+            'message': 'Folder ID set successfully',
+            'folderId': folder_id
+        })
+        
+        return response, 200
+        
+    except Exception as e:
+        logger.error(f"Error in set_folder_id: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 def allowed_file(filename):
     """Check if the file extension is allowed"""
@@ -696,36 +670,6 @@ def internal_error(error):
     response.headers['X-Error-Code'] = 'INTERNAL_SERVER_ERROR'
     return response, 500
 
-@app.errorhandler(502)
-def bad_gateway_error(error):
-    logger.error(f"502 error: {error}")
-    response = jsonify({
-        "status": "error",
-        "error": "Bad Gateway",
-        "message": "The server received an invalid response from the upstream server",
-        "path": request.path,
-        "timestamp": time.time(),
-        "request_id": request.headers.get('X-Request-ID', 'unknown')
-    })
-    response.headers['X-Error-Code'] = 'BAD_GATEWAY'
-    return response, 502
-
-@app.errorhandler(503)
-def service_unavailable_error(error):
-    logger.error(f"503 error: {error}")
-    response = jsonify({
-        "status": "error",
-        "error": "Service Unavailable",
-        "message": "The service is temporarily unavailable",
-        "path": request.path,
-        "timestamp": time.time(),
-        "request_id": request.headers.get('X-Request-ID', 'unknown'),
-        "retry_after": 300
-    })
-    response.headers['X-Error-Code'] = 'SERVICE_UNAVAILABLE'
-    response.headers['Retry-After'] = '300'
-    return response, 503
-
 @app.errorhandler(TimeoutError)
 def timeout_error(error):
     logger.error(f"Request timeout: {error}")
@@ -794,5 +738,3 @@ if __name__ == '__main__':
         ssl_context=ssl_context,
         use_reloader=debug
     )
-
-                             
