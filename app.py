@@ -29,6 +29,8 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import psutil
 import gc
+import wraps
+import resource
 
 # Load environment variables
 load_dotenv()
@@ -510,6 +512,13 @@ def set_folder_id():
             'status': 'error',
             'message': str(e)
         }), 500
+
+def set_memory_limits():
+    try:
+        # Limit maximum memory to 512MB
+        resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, -1))
+    except Exception as e:
+        logger.warning(f"Could not set memory limits: {e}")
     
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit upload size to 16MB
 
@@ -544,6 +553,7 @@ def search_face():
             'message': 'Image processing failed',
             'error': str(e)
         }), 500
+    pass
 
 
 @app.route('/image/<file_id>')
@@ -613,10 +623,18 @@ def manage_memory(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
+            # Clear memory before execution
+            gc.collect()
+            
+            # Execute the function
             result = func(*args, **kwargs)
-            gc.collect()  # Force garbage collection
+            
+            # Clear memory after execution
+            gc.collect()
+            
             return result
         except Exception as e:
+            # Ensure memory is cleared even if an error occurs
             gc.collect()
             raise e
     return wrapper
@@ -829,6 +847,22 @@ def init_services():
     except Exception as e:
         logger.critical(f"Error during service initialization: {e}")
         return False
+    
+def init_memory_management():
+    # Enable garbage collection
+    gc.enable()
+    
+    # Set aggressive garbage collection thresholds
+    gc.set_threshold(700, 10, 5)
+    
+    # Set memory limits
+    set_memory_limits()
+    
+    # Log initial memory usage
+    log_memory_usage()
+
+# Add this near the start of your app initialization
+init_memory_management()
 
 if __name__ == '__main__':
     # Initialize services
