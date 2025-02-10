@@ -29,6 +29,10 @@ rsa>=4.7.2
 six>=1.16.0
 urllib3<2.0.0  # Added for boto3 compatibility
 
+requests==2.31.0
+gunicorn==21.2.0
+python-dotenv==1.0.0
+
 # Installation Instructions:
 # 1. Save this as requirements.txt
 # 2. (Optional) Create and activate a virtual environment
