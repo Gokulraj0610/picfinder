@@ -520,29 +520,32 @@ def set_folder_id():
             'status': 'error',
             'message': str(e)
         }), 500
+    
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit upload size to 16MB
 
 @app.route('/search-face', methods=['POST'])
 def search_face():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-
-    file = request.files['file']
-    if file.filename == '' or not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type'}), 400
-
     try:
-        image_bytes = file.read()
-        if len(image_bytes) > MAX_IMAGE_SIZE:
-            return jsonify({'error': 'Image size must be less than 15MB'}), 400
-
-        return Response(
-            stream_results(process_image_stream(image_bytes)),
-            mimetype='application/x-ndjson'
-        )
-
+        # After finding the image
+        image_data = process_image()  # Your image processing function
+        
+        # Send image and clear memory
+        response = make_response(send_file(
+            io.BytesIO(image_data),
+            mimetype='image/jpeg'
+        ))
+        
+        # Clear memory explicitly
+        image_data = None
+        gc.collect()  # Force garbage collection
+        
+        return response
+        
     except Exception as e:
-        logger.error(f"Error in search_face: {e}")
-        return jsonify({'error': str(e)}), 500
+        # Log error and clean up
+        logging.error(f"Error processing image: {str(e)}")
+        gc.collect()
+        return jsonify({'error': 'Image processing failed'}), 500
 
 @app.route('/image/<file_id>')
 def serve_image(file_id):
@@ -606,6 +609,16 @@ def serve_image(file_id):
 def allowed_file(filename):
     """Check if the file extension is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def cleanup_temporary_files():
+    temp_dir = "path/to/temp/directory"
+    for filename in os.listdir(temp_dir):
+        file_path = os.path.join(temp_dir, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+        except Exception as e:
+            logging.error(f"Error deleting {file_path}: {str(e)}")
 
 # Enhanced error handlers
 @app.errorhandler(400)
